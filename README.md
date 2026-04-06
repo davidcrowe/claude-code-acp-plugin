@@ -60,4 +60,4 @@ claude plugin disable agentic-control-plane
 ## Support
 
 - Site: https://agenticcontrolplane.com
-- Issues: https://github.com/gatewaystack/claude-code-plugin/issues
+- Issues: https://github.com/davidcrowe/claude-code-acp-plugin/issues

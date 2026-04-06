@@ -39,7 +39,7 @@ cat > "$PLUGIN_DIR/plugin.json" << 'PLUGIN'
   "description": "Identity, governance, and audit for every Claude Code tool call. Logs all tool usage, enforces policies, and gives teams full visibility — without changing how you use Claude.",
   "author": "GatewayStack",
   "homepage": "https://agenticcontrolplane.com",
-  "repository": "https://github.com/gatewaystack/claude-code-plugin",
+  "repository": "https://github.com/davidcrowe/claude-code-acp-plugin",
   "hooks": "./hooks/hooks.json"
 }
 PLUGIN
