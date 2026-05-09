@@ -123,10 +123,36 @@ test("VENDOR_PATTERNS: shape is consistent", () => {
     assert.equal(typeof p.envVar, "string");
     assert.match(p.provider, /^[a-z][a-z0-9-]*$/, "provider must be canonical lowercase");
     assert.match(p.envVar, /^[A-Z][A-Z0-9_]*$/, "envVar must be SCREAMING_SNAKE");
+    // If hostVar set, hostValue must also be set
+    if (p.hostVar !== undefined) {
+      assert.match(p.hostVar, /^[A-Z][A-Z0-9_]*$/, "hostVar must be SCREAMING_SNAKE");
+      assert.equal(typeof p.hostValue, "string", "hostValue required when hostVar is set");
+      assert.ok(p.hostValue.length > 0, "hostValue must be non-empty");
+      assert.ok(!p.hostValue.includes("://"), "hostValue must be hostname-only, no protocol");
+    }
   }
 });
 
-test("VENDOR_PATTERNS: all current entries are GitHub (Phase 1 vendor #1)", () => {
+test("VENDOR_PATTERNS: gh CLI pattern has GH_HOST proxy routing", () => {
+  // The gh pattern is the only one with full proxy support today —
+  // GH_HOST + GH_TOKEN sent together routes through ACP's egress proxy.
+  const ghPattern = VENDOR_PATTERNS.find((p) => p.regex.source.startsWith("^gh"));
+  assert.ok(ghPattern, "gh pattern must exist");
+  assert.equal(ghPattern.hostVar, "GH_HOST");
+  assert.match(ghPattern.hostValue, /agenticcontrolplane\.com|localhost/);
+});
+
+test("VENDOR_PATTERNS: curl/git-push patterns are token-only (no proxy)", () => {
+  // curl + git push patterns issue a scoped token but the call still
+  // goes direct to the vendor. Document this with the test so a future
+  // contributor adding hostVar to them does so intentionally.
+  const nonGh = VENDOR_PATTERNS.filter((p) => !p.regex.source.startsWith("^gh"));
+  for (const p of nonGh) {
+    assert.equal(p.hostVar, undefined, `pattern ${p.regex} should not have hostVar yet`);
+  }
+});
+
+test("VENDOR_PATTERNS: all current entries are GitHub (Phase 1+2 vendor #1)", () => {
   // When we add Slack/Salesforce/etc. (Phase 3+), this assertion
   // updates. Today, only GitHub is in scope, so this guards against
   // accidentally adding a pattern without bumping the test list.
