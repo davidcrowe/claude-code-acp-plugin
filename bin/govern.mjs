@@ -39,14 +39,12 @@
 
 import { readFileSync } from "fs";
 import { homedir } from "os";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
-import { detectVendor } from "../lib/vendor-patterns.mjs";
+import { join } from "path";
 
 const ACP_API =
   process.env.ACP_API_BASE || "https://api.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.5.0";
+const PLUGIN_VERSION = "0.6.0";
 
 // Identifies the calling client to the server (per-client policy routing).
 // Each client's hooks.json sets this env var at invocation time:
@@ -57,6 +55,53 @@ const ACP_CLIENT = process.env.ACP_CLIENT || "claude-code-plugin";
 // 200 KB ceiling on the tool_output payload we send to the backend. Matches
 // the backend's scan ceiling.
 const POST_HOOK_PAYLOAD_CEILING = 200 * 1024;
+
+// Hostname-only form of ACP_API for env-var injection (e.g. GH_HOST).
+// gh CLI accepts hostnames, not URLs — strip protocol + trailing slash.
+const ACP_HOST = ACP_API.replace(/^https?:\/\//, "").replace(/\/$/, "");
+
+// Phase 1+2 (cross-arch broker, gatewaystack-connect#114):
+// Vendor patterns map matched Bash commands to a (provider, env-var,
+// optional proxy-host) triple. Inlined here so govern.mjs is a single
+// self-contained file that works in any install layout. Canonical copy
+// also lives in lib/vendor-patterns.mjs for the test suite — keep both
+// in sync.
+//
+// hostVar / hostValue (added in v0.6.0): when present, the rewritten
+// command sets that env var to redirect the upstream tool through ACP's
+// egress proxy. For gh CLI: GH_HOST=<acp-host> → gh routes to
+// https://<acp-host>/api/v3/* (GitHub Enterprise URL convention) where
+// ACP's proxy at /api/v3 verifies the scoped token and forwards to
+// api.github.com with the user's real OAuth credential. Calls without
+// hostVar/hostValue (curl, git push) issue a scoped token but the call
+// still goes direct to the vendor with the token; in those cases the
+// scoped token is only auditable, not actually validating against the
+// proxy. Future versions will rewrite curl URLs too.
+const VENDOR_PATTERNS = [
+  // GitHub — gh CLI (full proxy: GH_HOST + GH_TOKEN)
+  {
+    regex: /^gh(\s|$)/,
+    provider: "github",
+    envVar: "GH_TOKEN",
+    hostVar: "GH_HOST",
+    hostValue: ACP_HOST,
+  },
+  // GitHub — direct REST via curl (token-only injection; proxy rewrite
+  // would require URL substitution, deferred to a follow-up)
+  { regex: /^curl\s+(.*\s)?(https?:\/\/)?api\.github\.com/, provider: "github", envVar: "GH_TOKEN" },
+  // GitHub — git push over HTTPS (token-only injection)
+  { regex: /^git\s+push\s+https:\/\/github\.com\//, provider: "github", envVar: "GH_TOKEN" },
+];
+
+function detectVendor(toolName, toolInput) {
+  if (toolName !== "Bash") return null;
+  const cmd = (toolInput?.command ?? "").toString().trim();
+  if (!cmd) return null;
+  for (const p of VENDOR_PATTERNS) {
+    if (p.regex.test(cmd)) return p;
+  }
+  return null;
+}
 
 function readToken() {
   if (process.env.ACP_BEARER_TOKEN) return process.env.ACP_BEARER_TOKEN;
@@ -267,11 +312,19 @@ async function handlePreToolUse() {
 
   // Success — inject the ACP-issued token via updatedInput.command.
   // Bash inherits the env var naturally when it executes the prefixed
-  // command, so the user's existing `gh repo list` workflow keeps
-  // working but now with an ACP-brokered credential.
+  // command. For vendors with a `hostVar` (gh CLI: GH_HOST), also set
+  // that to the ACP host so the upstream tool routes through ACP's
+  // egress proxy at /api/v3/* (Phase 2). The agent's command keeps
+  // working unchanged, but the call flows through ACP — credentials
+  // never leave the gateway.
   if (tokenResult.token && input.tool_input?.command) {
     const original = String(input.tool_input.command);
-    const updated = `${vendor.envVar}=${tokenResult.token} ${original}`;
+    const envParts = [];
+    if (vendor.hostVar && vendor.hostValue) {
+      envParts.push(`${vendor.hostVar}=${vendor.hostValue}`);
+    }
+    envParts.push(`${vendor.envVar}=${tokenResult.token}`);
+    const updated = `${envParts.join(" ")} ${original}`;
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
