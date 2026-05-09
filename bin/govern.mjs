@@ -39,9 +39,7 @@
 
 import { readFileSync } from "fs";
 import { homedir } from "os";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
-import { detectVendor } from "../lib/vendor-patterns.mjs";
+import { join } from "path";
 
 const ACP_API =
   process.env.ACP_API_BASE || "https://api.agenticcontrolplane.com";
@@ -57,6 +55,34 @@ const ACP_CLIENT = process.env.ACP_CLIENT || "claude-code-plugin";
 // 200 KB ceiling on the tool_output payload we send to the backend. Matches
 // the backend's scan ceiling.
 const POST_HOOK_PAYLOAD_CEILING = 200 * 1024;
+
+// Phase 1 (cross-arch broker, gatewaystack-connect#114):
+// Vendor patterns map matched Bash commands to a (provider, env-var) pair.
+// Inlined here so govern.mjs is a single self-contained file that works
+// in any install layout (plugin repo's bin/, the user's ~/.acp/, install.sh
+// heredoc, etc). The canonical version of these patterns ALSO lives in
+// lib/vendor-patterns.mjs which the test suite imports — keep both in sync.
+// Adding a new vendor: add a row here AND in lib/vendor-patterns.mjs +
+// ensure gatewaystack-connect's userConnect.ts PROVIDERS list includes
+// the same canonical lowercase provider key.
+const VENDOR_PATTERNS = [
+  // GitHub — gh CLI
+  { regex: /^gh(\s|$)/, provider: "github", envVar: "GH_TOKEN" },
+  // GitHub — direct REST via curl
+  { regex: /^curl\s+(.*\s)?(https?:\/\/)?api\.github\.com/, provider: "github", envVar: "GH_TOKEN" },
+  // GitHub — git push over HTTPS
+  { regex: /^git\s+push\s+https:\/\/github\.com\//, provider: "github", envVar: "GH_TOKEN" },
+];
+
+function detectVendor(toolName, toolInput) {
+  if (toolName !== "Bash") return null;
+  const cmd = (toolInput?.command ?? "").toString().trim();
+  if (!cmd) return null;
+  for (const p of VENDOR_PATTERNS) {
+    if (p.regex.test(cmd)) return p;
+  }
+  return null;
+}
 
 function readToken() {
   if (process.env.ACP_BEARER_TOKEN) return process.env.ACP_BEARER_TOKEN;
