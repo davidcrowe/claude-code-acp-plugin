@@ -44,7 +44,7 @@ import { join } from "path";
 const ACP_API =
   process.env.ACP_API_BASE || "https://api.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.6.0";
+const PLUGIN_VERSION = "0.6.1";
 
 // Identifies the calling client to the server (per-client policy routing).
 // Each client's hooks.json sets this env var at invocation time:
@@ -78,11 +78,16 @@ const ACP_HOST = ACP_API.replace(/^https?:\/\//, "").replace(/\/$/, "");
 // scoped token is only auditable, not actually validating against the
 // proxy. Future versions will rewrite curl URLs too.
 const VENDOR_PATTERNS = [
-  // GitHub — gh CLI (full proxy: GH_HOST + GH_TOKEN)
+  // GitHub — gh CLI (full proxy: GH_HOST + GH_ENTERPRISE_TOKEN).
+  // gh maps GH_TOKEN to github.com only; for any non-github.com host
+  // (which an ACP-routed call is, by design) gh requires
+  // GH_ENTERPRISE_TOKEN. Using the wrong env var causes gh to fall back
+  // to its config-stored token, which is usually a stale acp_st_* from
+  // a prior session — leading to 400 Bad Request from the gateway.
   {
     regex: /^gh(\s|$)/,
     provider: "github",
-    envVar: "GH_TOKEN",
+    envVar: "GH_ENTERPRISE_TOKEN",
     hostVar: "GH_HOST",
     hostValue: ACP_HOST,
   },
