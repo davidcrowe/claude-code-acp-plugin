@@ -35,7 +35,9 @@ test("detectVendor: matches gh CLI invocations", () => {
     const result = detectVendor("Bash", { command: cmd });
     assert.ok(result, `expected match for: ${cmd}`);
     assert.equal(result.provider, "github");
-    assert.equal(result.envVar, "GH_TOKEN");
+    // gh requires GH_ENTERPRISE_TOKEN for non-github.com hosts (and an
+    // ACP-routed call IS by definition routed to a non-github.com host).
+    assert.equal(result.envVar, "GH_ENTERPRISE_TOKEN");
   }
 });
 
