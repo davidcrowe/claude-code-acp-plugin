@@ -41,10 +41,24 @@ import { readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
+// Data-plane base. Vendor egress proxying (e.g. GH_HOST → /api/v3) must
+// stay on the main gateway — those routes are not served by the
+// control-plane service.
 const ACP_API =
   process.env.ACP_API_BASE || "https://api.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.6.1";
+// Control-plane base for hook decisions + scoped-token exchange
+// (gatewaystack-connect#246). These have a 4s budget and go to a dedicated
+// service so they never queue behind model-proxy streams. Falls back to
+// ACP_API_BASE for self-hosted single-service deployments. The run.app URL
+// is Cloud Run's stable service address; a branded alias
+// (govern.agenticcontrolplane.com) may replace it in a future release.
+const ACP_GOVERN =
+  process.env.ACP_GOVERN_BASE ||
+  process.env.ACP_API_BASE ||
+  "https://gatewaystack-govern-322861301520.us-central1.run.app";
+
+const PLUGIN_VERSION = "0.6.2";
 
 // Identifies the calling client to the server (per-client policy routing).
 // Each client's hooks.json sets this env var at invocation time:
@@ -148,7 +162,7 @@ async function requestScopedToken(provider) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
   try {
-    const res = await fetch(`${ACP_API}/api/v1/scoped-tokens`, {
+    const res = await fetch(`${ACP_GOVERN}/api/v1/scoped-tokens`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -237,7 +251,7 @@ async function handlePreToolUse() {
   // Step 1: policy check.
   let policyAllowed = true;
   try {
-    const res = await fetch(`${ACP_API}/govern/tool-use`, {
+    const res = await fetch(`${ACP_GOVERN}/govern/tool-use`, {
       method: "POST",
       headers,
       body,
@@ -372,7 +386,7 @@ async function handlePostToolUse() {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
   try {
-    const res = await fetch(`${ACP_API}/govern/tool-output`, { method: "POST", headers, body, signal: controller.signal });
+    const res = await fetch(`${ACP_GOVERN}/govern/tool-output`, { method: "POST", headers, body, signal: controller.signal });
     clearTimeout(timeout);
     if (!res.ok) { process.exit(0); }
     const data = await res.json();
