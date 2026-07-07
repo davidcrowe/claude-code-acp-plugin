@@ -56,9 +56,9 @@ const ACP_API =
 const ACP_GOVERN =
   process.env.ACP_GOVERN_BASE ||
   process.env.ACP_API_BASE ||
-  "https://gatewaystack-govern-322861301520.us-central1.run.app";
+  "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.6.2";
+const PLUGIN_VERSION = "0.6.3";
 
 // Identifies the calling client to the server (per-client policy routing).
 // Each client's hooks.json sets this env var at invocation time:
