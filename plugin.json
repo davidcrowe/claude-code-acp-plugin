@@ -4,7 +4,7 @@
   "description": "Identity, governance, and audit for every Claude Code tool call. Logs all tool usage, enforces policies, and gives teams full visibility \u2014 without changing how you use Claude.",
   "author": "GatewayStack",
   "homepage": "https://agenticcontrolplane.com",
-  "repository": "https://github.com/davidcrowe/claude-code-acp-plugin",
+  "repository": "https://github.com/agentic-control-plane/claude-code-acp-plugin",
   "hooks": "./hooks/hooks.json",
   "mcpServers": {
     "acp": {

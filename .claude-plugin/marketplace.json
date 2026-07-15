@@ -10,11 +10,20 @@
       "source": "./",
       "description": "Control, audit, and cost-optimize every Claude Code tool call. Governance hook + bundled ACP MCP (cost X-ray, run traces, policy checks) + /cost-xray pre-ship report.",
       "version": "0.8.0",
-      "author": { "name": "GatewayStack" },
+      "author": {
+        "name": "GatewayStack"
+      },
       "homepage": "https://agenticcontrolplane.com",
-      "repository": "https://github.com/davidcrowe/claude-code-acp-plugin",
+      "repository": "https://github.com/agentic-control-plane/claude-code-acp-plugin",
       "license": "MIT",
-      "keywords": ["governance", "audit", "cost", "security", "mcp", "observability"],
+      "keywords": [
+        "governance",
+        "audit",
+        "cost",
+        "security",
+        "mcp",
+        "observability"
+      ],
       "category": "security"
     }
   ]
