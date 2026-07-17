@@ -6,6 +6,8 @@ When active, **every tool call** Claude makes — `Bash`, `Read`, `Write`, `Edit
 
 ACP doesn't replace your tools or change how you use Claude. It's the governance layer that sits transparently in front of everything.
 
+Docs: [install guide + troubleshooting](https://agenticcontrolplane.com/integrations/claude-code) · [which Claude Code tools to deny out of the box](https://agenticcontrolplane.com/blog/which-claude-code-tools-to-deny-out-of-the-box) · [the Tool Surface Index](https://agenticcontrolplane.com/tool-surfaces) — every tool one Claude Code session declares, grouped by blast radius
+
 ## One-command install
 
 ```bash
