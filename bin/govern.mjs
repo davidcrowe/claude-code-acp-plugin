@@ -58,13 +58,23 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.6.3";
+const PLUGIN_VERSION = "0.6.4";
 
 // Identifies the calling client to the server (per-client policy routing).
 // Each client's hooks.json sets this env var at invocation time:
 // "claude-code-plugin", "cursor", "codex", etc. Falls back to
 // claude-code-plugin for backward compat.
 const ACP_CLIENT = process.env.ACP_CLIENT || "claude-code-plugin";
+
+// Harness quirk switch. Codex adopted Claude Code's hook wire format but
+// its parser only ACTS on permissionDecision "deny" — "ask" and
+// updatedInput are rejected, which marks the hook run FAILED and lets the
+// tool call proceed (fail-open on exactly the calls that needed review).
+// Under codex we therefore (a) map ask → deny with the approval link in
+// the message (approve on the dashboard, re-run, the grant admits it) and
+// (b) skip updatedInput vendor-token injection. The Codex plugin's
+// hooks.json sets ACP_HARNESS=codex.
+const HARNESS = process.env.ACP_HARNESS || "claude-code";
 
 // 200 KB ceiling on the tool_output payload we send to the backend. Matches
 // the backend's scan ceiling.
@@ -241,8 +251,12 @@ async function handlePreToolUse() {
     process.exit(0);
   }
   function ask(reason) {
+    // Codex has no ask semantic on the wire (see HARNESS note): emit deny
+    // with the approval deep link so the human approves out-of-band and
+    // the re-run passes under the grant.
+    const decision = HARNESS === "codex" ? "deny" : "ask";
     process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask" },
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: decision },
       systemMessage: `[ACP] Approval required: ${reason}`,
     }));
     process.exit(0);
@@ -287,6 +301,13 @@ async function handlePreToolUse() {
   // local PAT is never read; ACP brokers the credential.
   const vendor = detectVendor(input.tool_name, input.tool_input);
   if (!vendor || !policyAllowed) {
+    process.exit(0);
+  }
+
+  // Codex rejects updatedInput (see HARNESS note) — attempting injection
+  // would mark the hook failed and run the tool anyway, minus the token.
+  // Skip cleanly; the local-credential workflow continues unchanged.
+  if (HARNESS === "codex") {
     process.exit(0);
   }
 
