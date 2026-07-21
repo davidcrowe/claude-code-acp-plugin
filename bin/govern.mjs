@@ -19,25 +19,28 @@
 //   5. If the scoped-token endpoint isn't enabled (404), pass through —
 //      existing local-credential workflows continue unchanged.
 //
-// Three distinct deny categories — keep the prefixes distinct so a user
-// can tell at-a-glance whether a tool was blocked because policy denied
-// it, because the gateway returned an error (auth, 5xx), or because we
-// couldn't reach the gateway at all:
-//   "[ACP] Denied by policy: ..."
-//   "[ACP] Gateway error — tool blocked for safety (HTTP X)"
-//   "[ACP] Gateway unreachable — tool blocked for safety (timed out / network)"
+// Outcome categories — keep the prefixes distinct so a user can tell
+// at-a-glance what happened:
+//   "[ACP] Denied by policy: ..."            (policy said no — all tiers)
+//   "[ACP] ⚠ UNGOVERNED: gateway unreachable" (interactive lapse — proceeded, logged)
+//   "[ACP] Gateway unreachable ... stays blocked" (unattended tier fail-closed)
 //
 // Phase 1 of cross-arch credential brokering — see
 // gatewaystack-connect/docs/cross-arch-governance-strategy.md (parent
 // epic gatewaystack-connect#114, this work tracked at gatewaystack-connect#115).
 //
-// Fails OPEN on /govern/tool-use network/parse errors (existing behavior).
+// Unreachability posture (#385, 2026-07-21): interactive tier fails OPEN
+// with a loud UNGOVERNED warning + ~/.acp/lapse.log entry (never-brick:
+// an ACP outage must not freeze every governed session); subagent /
+// background tiers fail CLOSED (nobody is watching — the block IS the
+// safety net). Note: before v0.6.5 this comment claimed fail-open while
+// the code failed closed — the posture is now real, decided, and tested.
 // Fails OPEN on /api/v1/scoped-tokens errors by default — server-side
 // per-tenant policy can flip this to fail-closed. The plugin currently
 // always fails open on token-request errors and surfaces a stderr warning;
 // future versions will respect the server's `scopedTokensFailMode` policy.
 
-import { readFileSync } from "fs";
+import { readFileSync, appendFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
@@ -58,7 +61,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.6.4";
+const PLUGIN_VERSION = "0.6.5";
 
 // Identifies the calling client to the server (per-client policy routing).
 // Each client's hooks.json sets this env var at invocation time:
@@ -235,20 +238,40 @@ async function handlePreToolUse() {
     }));
     process.exit(0);
   }
-  function denyGatewayError(status, statusText) {
-    const detail = statusText ? `HTTP ${status} ${statusText}` : `HTTP ${status}`;
+  // Unreachability posture (#385, decided 2026-07-21): fail-open is the
+  // universal default and every lapse is LOUD (never-brick). An ACP outage
+  // must not freeze every governed interactive session at once — a human is
+  // present to read the warning. Unattended tiers (subagent/background/api)
+  // have nobody watching, so for them the block IS the safety net: they
+  // stay fail-closed. Policy denies are unaffected — this is only about
+  // not being able to ASK the policy.
+  function failPostureOnOutage(detail) {
+    const tier = resolveAgentTier();
+    if (tier === "interactive") {
+      // Lapse, loudly, and leave an audit trail ACP never saw.
+      try {
+        appendFileSync(join(homedir(), ".acp", "lapse.log"),
+          JSON.stringify({ at: new Date().toISOString(), tool: input.tool_name, tier, detail }) + "\n");
+      } catch { /* the lapse log is best-effort — never block on it */ }
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+        systemMessage: `[ACP] ⚠ UNGOVERNED: gateway unreachable (${detail}) — call proceeded WITHOUT policy check. Lapse logged to ~/.acp/lapse.log; ACP has no record of this action.`,
+      }));
+      process.exit(0);
+    }
+    // Unattended tier: hold the line, say why honestly.
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" },
-      systemMessage: `[ACP] Gateway error — tool blocked for safety (${detail})`,
+      systemMessage: `[ACP] Gateway unreachable (${detail}) — ${tier} tier stays blocked when policy can't be consulted (fail-closed for unattended agents; interactive sessions fail open).`,
     }));
     process.exit(0);
   }
+  function denyGatewayError(status, statusText) {
+    const detail = statusText ? `HTTP ${status} ${statusText}` : `HTTP ${status}`;
+    failPostureOnOutage(detail);
+  }
   function denyUnreachable(detail) {
-    process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" },
-      systemMessage: `[ACP] Gateway unreachable — tool blocked for safety${detail ? ` (${detail})` : ""}`,
-    }));
-    process.exit(0);
+    failPostureOnOutage(detail || "network error");
   }
   function ask(reason) {
     // Codex has no ask semantic on the wire (see HARNESS note): emit deny
