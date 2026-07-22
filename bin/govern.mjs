@@ -43,7 +43,8 @@
 import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { pathToFileURL } from "url";
+import { createHash } from "crypto";
+import { pathToFileURL, fileURLToPath } from "url";
 
 // Data-plane base. Vendor egress proxying (e.g. GH_HOST → /api/v3) must
 // stay on the main gateway — those routes are not served by the
@@ -62,7 +63,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.6.7";
+const PLUGIN_VERSION = "0.9.0";
 
 // Identifies the calling client to the server (per-client policy routing).
 // Each client's hooks.json sets this env var at invocation time:
@@ -590,6 +591,56 @@ async function handlePostToolUse() {
   process.exit(0);
 }
 
+// ── Session-start attestation (#403 paired arrival, the #375 lesson) ──
+//
+// At session start the hook proves what is actually running: the sha256
+// of THIS file as loaded from disk, the plugin version, and whether the
+// harness-grants file is present (capability must never arrive without
+// authority — grants and hook are a pair). The gateway compares the hash
+// against the first-seen hash for this version; a mismatch is the
+// edited-hook signature and pages the founder. Fire-and-forget and
+// fail-open in every branch: attestation is observability, and it must
+// never delay or block a session — an absent attestation is itself the
+// signal (the console shows the session as "unattested").
+function sha256FileHex(path) {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+async function handleSessionStart() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+  try {
+    const hookHash = sha256FileHex(fileURLToPath(import.meta.url));
+    if (!hookHash) process.exit(0);
+    const grantsHash = sha256FileHex(join(homedir(), ".acp", "harness-grants.json"));
+    await fetch(`${ACP_GOVERN}/govern/attest`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        session_id: input.session_id,
+        cwd: input.cwd,
+        hook_event_name: "SessionStart",
+        plugin_version: PLUGIN_VERSION,
+        hook_hash: hookHash,
+        grants_present: grantsHash !== null,
+        ...(grantsHash ? { grants_hash: grantsHash } : {}),
+        harness: HARNESS,
+      }),
+      signal: controller.signal,
+    });
+  } catch {
+    // silent — absence of attestation is visible server-side by design
+  } finally {
+    clearTimeout(timeout);
+  }
+  process.exit(0);
+}
+
 const hookEvent = typeof input.hook_event_name === "string" ? input.hook_event_name : "PreToolUse";
 if (hookEvent === "PostToolUse") handlePostToolUse();
+else if (hookEvent === "SessionStart") handleSessionStart();
 else handlePreToolUse();
