@@ -2,7 +2,7 @@
 
 Identity, governance, and audit for every Claude Code tool call.
 
-When active, **every tool call** Claude makes — `Bash`, `Read`, `Write`, `Edit`, `WebFetch`, and all MCP tools — is logged to your ACP workspace. Set policies to control what's allowed. Get full compliance visibility across your team.
+When active, **every tool call** Claude makes — `Bash`, `Read`, `Write`, `Edit`, `WebFetch`, and all MCP tools — is checked against your policy and logged: on your machine by default, or to a shared ACP workspace once you connect a team. Set policies to control what's allowed; get full audit visibility.
 
 ACP doesn't replace your tools or change how you use Claude. It's the governance layer that sits transparently in front of everything.
 
@@ -11,10 +11,17 @@ Docs: [install guide + troubleshooting](https://agenticcontrolplane.com/integrat
 ## One-command install
 
 ```bash
-curl -sf https://agenticcontrolplane.com/install.sh | bash
+# Free, on-device, no account — governs Claude Code locally:
+curl -sf https://agenticcontrolplane.com/install.sh | bash -s -- --local
 ```
 
-This installs the plugin, opens your browser to sign up / log in, provisions your workspace, and activates the governance hook. You'll land on your audit log dashboard — done.
+This installs the plugin plus the on-device engine and activates the governance hook. Every Claude Code tool call is checked against `~/.acp/policy.json` and logged to `~/.acp/audit.jsonl` — no account, nothing leaves your machine. Restart Claude Code and you're governed.
+
+Want team policy across everyone's agents, verified identity, and the cost X-ray? Run it **without** `--local` and the installer opens your browser to provision a shared workspace instead:
+
+```bash
+curl -sf https://agenticcontrolplane.com/install.sh | bash
+```
 
 Already have the plugin? Run `/acp-connect` inside Claude Code to connect.
 
@@ -22,10 +29,10 @@ Already have the plugin? Run `/acp-connect` inside Claude Code to connect.
 
 The plugin registers a **PreToolUse hook** that fires before every tool call:
 
-1. Hook sends tool name + input to ACP's governance API
-2. ACP runs a 6-layer pipeline: immutable rules, scope enforcement, ABAC policies, rate limits, budget caps, content scanning
+1. Hook sends tool name + input to the decision engine — on-device (`~/.acp/decide.mjs`) in `--local` mode, or ACP's governance API when connected to a workspace
+2. The engine evaluates your policy: immutable safety floor, scope enforcement, ABAC policies, rate limits, budget caps, content scanning (the full 6-layer pipeline in cloud mode; the safety floor + your `policy.json` on-device)
 3. Returns `allow` or `deny`
-4. All calls are logged to your workspace's audit trail
+4. All calls are logged — to `~/.acp/audit.jsonl` on-device, or your workspace's audit trail when connected
 
 The hook **fails open** on network errors — ACP outages never block Claude Code.
 
