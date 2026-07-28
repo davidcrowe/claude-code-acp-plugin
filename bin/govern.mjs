@@ -40,9 +40,10 @@
 // always fails open on token-request errors and surfaces a stderr warning;
 // future versions will respect the server's `scopedTokensFailMode` policy.
 
-import { readFileSync, appendFileSync } from "fs";
+import { readFileSync, appendFileSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { pathToFileURL } from "url";
 
 // Data-plane base. Vendor egress proxying (e.g. GH_HOST → /api/v3) must
 // stay on the main gateway — those routes are not served by the
@@ -61,7 +62,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.6.5";
+const PLUGIN_VERSION = "0.6.6";
 
 // Identifies the calling client to the server (per-client policy routing).
 // Each client's hooks.json sets this env var at invocation time:
@@ -145,13 +146,95 @@ function readToken() {
 }
 
 const token = readToken();
-if (!token) process.exit(0);
 
+// LOCAL mode — the no-login, on-device runtime (`install.sh --local`).
+// Active when there is no workspace token AND either a local policy exists
+// or ACP_LOCAL=1. Decisions are made on-device by decide.mjs against
+// ~/.acp/policy.json; every call is logged to ~/.acp/audit.jsonl. None of
+// the fetch() paths below are reachable — nothing leaves the machine.
+const ACP_DIR = join(homedir(), ".acp");
+const LOCAL =
+  !token &&
+  (process.env.ACP_LOCAL === "1" || existsSync(join(ACP_DIR, "policy.json")));
+if (!token && !LOCAL) process.exit(0);
+
+// Read stdin via async iteration, not readFileSync("/dev/stdin"): on Linux a
+// non-blocking pipe makes the sync read throw EAGAIN, which would silently
+// skip governance for every call. (Caught by CI on ubuntu in acp-install.)
 let input;
 try {
-  input = JSON.parse(readFileSync("/dev/stdin", "utf8"));
+  process.stdin.setEncoding("utf8");
+  let raw = "";
+  for await (const chunk of process.stdin) raw += chunk;
+  input = JSON.parse(raw);
 } catch {
   process.exit(0);
+}
+
+if (LOCAL) {
+  await runLocal(input);
+  process.exit(0);
+}
+
+async function runLocal(input) {
+  const audit = (obj) => {
+    try {
+      appendFileSync(join(ACP_DIR, "audit.jsonl"), JSON.stringify(obj) + "\n");
+    } catch { /* audit is best-effort — never block the call on it */ }
+  };
+  const ev = typeof input.hook_event_name === "string" ? input.hook_event_name : "PreToolUse";
+  if (ev === "PostToolUse") {
+    audit({ ts: new Date().toISOString(), event: "post", client: ACP_CLIENT, tool: input.tool_name });
+    return;
+  }
+  let policy = { default: "allow", rules: {} };
+  try {
+    policy = JSON.parse(readFileSync(join(ACP_DIR, "policy.json"), "utf8"));
+  } catch { /* no/invalid policy → defaults above; the safety floor still applies */ }
+  // The decision engine: prefer the installed copy (~/.acp/decide.mjs, kept
+  // current by the installer), fall back to the copy bundled next to this
+  // file (standalone plugin installs that never ran install.sh).
+  let decide;
+  try {
+    ({ decide } = await import(pathToFileURL(join(ACP_DIR, "decide.mjs")).href));
+  } catch {
+    try {
+      ({ decide } = await import("./decide.mjs"));
+    } catch {
+      // Engine missing/corrupt → never brick, but NEVER silently: say it
+      // loud and leave an audit line, same contract as the cloud path.
+      audit({ ts: new Date().toISOString(), event: "pre", client: ACP_CLIENT, tool: input.tool_name,
+              decision: "allow", source: "fail-open", reason: "local engine unavailable (~/.acp/decide.mjs)" });
+      process.stdout.write(JSON.stringify({
+        systemMessage: "[ACP·local] ⚠ decision engine unavailable (~/.acp/decide.mjs) — this call ran UNGOVERNED and was allowed. Re-run the installer to restore it.",
+      }));
+      return;
+    }
+  }
+  const d = decide(input.tool_name, input.tool_input, policy);
+  audit({ ts: new Date().toISOString(), event: "pre", client: ACP_CLIENT, tool: input.tool_name,
+          classified: d.classified, decision: d.decision, source: d.source, reason: d.reason });
+  if (d.decision === "deny") {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: `[ACP] ${d.reason}` },
+      systemMessage: `[ACP·local] Blocked: ${d.reason}`,
+    }));
+  } else if (d.decision === "ask") {
+    // Same harness quirk as the cloud path: Codex's parser only acts on
+    // "deny", so ask → deny with the fix in the message (edit the local
+    // policy, re-run). No dashboard link — there is no dashboard in local.
+    if (HARNESS === "codex") {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: `[ACP] ${d.reason}` },
+        systemMessage: `[ACP·local] Requires review (${d.reason}) — Codex can't ask mid-run, so the call is blocked. To allow it, set the rule in ~/.acp/policy.json and re-run.`,
+      }));
+    } else {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: `[ACP] ${d.reason}` },
+      }));
+    }
+  }
+  // allow → no output (silent allow, still logged to audit.jsonl)
 }
 
 const headers = {
