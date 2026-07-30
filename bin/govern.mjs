@@ -40,7 +40,7 @@
 // always fails open on token-request errors and surfaces a stderr warning;
 // future versions will respect the server's `scopedTokensFailMode` policy.
 
-import { readFileSync, appendFileSync, existsSync } from "fs";
+import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { pathToFileURL } from "url";
@@ -138,11 +138,48 @@ function detectVendor(toolName, toolInput) {
 
 function readToken() {
   if (process.env.ACP_BEARER_TOKEN) return process.env.ACP_BEARER_TOKEN;
-  try {
-    return readFileSync(join(homedir(), ".acp", "credentials"), "utf8").trim();
-  } catch {
-    return null;
+  // Both credential paths, in the same order as bin/mcp-auth-headers.sh —
+  // these MUST stay in sync. When only proxy-key exists, the MCP helper
+  // authenticates (tools appear, the key's lastUsedAt updates, the install
+  // looks healthy) while a credentials-only hook reads nothing and no-ops:
+  // governance silently absent on a machine that looks connected.
+  for (const name of ["credentials", "proxy-key"]) {
+    try {
+      const value = readFileSync(join(homedir(), ".acp", name), "utf8").trim();
+      if (value) return value;
+    } catch { /* absent or unreadable — try the next path */ }
   }
+  return null;
+}
+
+// Announce an uncredentialed session once, then stay quiet: loud enough that
+// nobody can believe they're governed when they aren't, bounded so a long
+// session isn't spammed on every tool call. The lapse line is written every
+// time regardless — the log is the durable record even when the banner is
+// deduped, and it's what makes the gap auditable after the fact.
+function warnUncredentialed(input) {
+  const sessionId = String(input?.session_id ?? "unknown");
+  try {
+    appendFileSync(
+      join(homedir(), ".acp", "lapse.log"),
+      `${new Date().toISOString()}\tUNGOVERNED\tno-credentials\tclient=${ACP_CLIENT}\tsession=${sessionId}\ttool=${input?.tool_name ?? "?"}\n`
+    );
+  } catch { /* the lapse log is best-effort — never block a call on it */ }
+
+  const marker = join(homedir(), ".acp", "nocred-session");
+  try {
+    if (readFileSync(marker, "utf8").trim() === sessionId) return;
+  } catch { /* no marker yet — this is the session's first call */ }
+  try {
+    mkdirSync(join(homedir(), ".acp"), { recursive: true });
+    writeFileSync(marker, sessionId);
+  } catch { /* best-effort — at worst the banner repeats */ }
+
+  process.stdout.write(JSON.stringify({
+    systemMessage:
+      "[ACP] ⚠ UNGOVERNED: no API key found at ~/.acp/credentials — tool calls are running WITHOUT policy checks, and ACP has no record of them. " +
+      "Get your key at https://cloud.agenticcontrolplane.com, then: echo 'YOUR_API_KEY' > ~/.acp/credentials — and restart this session.",
+  }));
 }
 
 const token = readToken();
@@ -156,11 +193,12 @@ const ACP_DIR = join(homedir(), ".acp");
 const LOCAL =
   !token &&
   (process.env.ACP_LOCAL === "1" || existsSync(join(ACP_DIR, "policy.json")));
-if (!token && !LOCAL) process.exit(0);
 
 // Read stdin via async iteration, not readFileSync("/dev/stdin"): on Linux a
 // non-blocking pipe makes the sync read throw EAGAIN, which would silently
 // skip governance for every call. (Caught by CI on ubuntu in acp-install.)
+// Read before the no-credentials check so the warning can name the session
+// and the tool it let through.
 let input;
 try {
   process.stdin.setEncoding("utf8");
@@ -168,6 +206,17 @@ try {
   for await (const chunk of process.stdin) raw += chunk;
   input = JSON.parse(raw);
 } catch {
+  process.exit(0);
+}
+
+// Wired but uncredentialed: the hook runs on every call and has nothing to
+// authenticate with, so each one proceeds unchecked. Never brick — but NEVER
+// silently, the same contract the unreachable-gateway and missing-engine
+// paths already honor. This branch was the exception, and that silence is
+// what let installs sit ungoverned for weeks while the installer reported
+// success and the server saw a workspace indistinguishable from unused.
+if (!token && !LOCAL) {
+  warnUncredentialed(input);
   process.exit(0);
 }
 

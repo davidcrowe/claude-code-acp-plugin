@@ -2,7 +2,10 @@
   "name": "agentic-control-plane",
   "version": "0.8.2",
   "description": "Identity, governance, and audit for every Claude Code tool call. Logs all tool usage, enforces policies, and gives teams full visibility \u2014 without changing how you use Claude.",
-  "author": "GatewayStack",
+  "author": {
+    "name": "GatewayStack",
+    "url": "https://agenticcontrolplane.com"
+  },
   "homepage": "https://agenticcontrolplane.com",
   "repository": "https://github.com/agentic-control-plane/claude-code-acp-plugin",
   "hooks": "./hooks/hooks.json",
