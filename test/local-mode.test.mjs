@@ -134,17 +134,32 @@ test("engine missing from HOME: bundled decide.mjs fallback keeps the floor", ()
   }
 });
 
-test("no token, no policy.json, no ACP_LOCAL: exits silently (cloud passthrough unchanged)", () => {
+test("no token, no policy.json, no ACP_LOCAL: proceeds but warns UNGOVERNED once per session", () => {
+  // Behavior changed with the front-door fix (PR #9): an uncredentialed
+  // hook must never exit silently — that silence is what let installs sit
+  // ungoverned for weeks. First call prints the banner; subsequent calls
+  // in the same session stay quiet (the marker dedupes).
   const bare = mkdtempSync(join(tmpdir(), "acp-local-off-"));
   try {
-    const res = spawnSync(process.execPath, [GOVERN], {
+    const first = spawnSync(process.execPath, [GOVERN], {
       input: JSON.stringify(pre("rm -rf ~/")),
       encoding: "utf8",
       env: { HOME: bare, PATH: process.env.PATH },
       timeout: 15000,
     });
-    assert.equal(res.status, 0);
-    assert.equal(res.stdout, "");
+    assert.equal(first.status, 0);
+    const out = JSON.parse(first.stdout);
+    assert.match(out.systemMessage, /UNGOVERNED: no API key found/);
+    assert.equal(out.hookSpecificOutput, undefined, "must not deny — never brick, just warn");
+
+    const second = spawnSync(process.execPath, [GOVERN], {
+      input: JSON.stringify(pre("rm -rf ~/")),
+      encoding: "utf8",
+      env: { HOME: bare, PATH: process.env.PATH },
+      timeout: 15000,
+    });
+    assert.equal(second.status, 0);
+    assert.equal(second.stdout, "", "same session: banner is deduped");
   } finally {
     rmSync(bare, { recursive: true, force: true });
   }

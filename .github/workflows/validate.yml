@@ -1,0 +1,49 @@
+# CI for the gap that hid a four-month total install failure (#593):
+# `claude plugin validate` checks marketplace.json, NOT plugin.json, so an
+# invalid plugin manifest false-greens locally while `claude plugin install`
+# fails for every user. A real install into a scratch HOME is the only
+# honest check — so CI performs one on every change.
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  manifest:
+    name: manifest schema + real install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Syntax-check hook scripts
+        run: |
+          for f in bin/*.mjs lib/*.mjs; do node --check "$f"; done
+
+      - name: Manifest schema checks (what `claude plugin validate` skips)
+        run: node scripts/validate-manifest.mjs
+
+      - name: Real install into a scratch HOME
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          export HOME="$RUNNER_TEMP/scratch-home"
+          mkdir -p "$HOME"
+          claude plugin marketplace add "$GITHUB_WORKSPACE"
+          claude plugin install agentic-control-plane@acp
+          claude plugin list | tee "$RUNNER_TEMP/plugins.txt"
+          grep -q "agentic-control-plane" "$RUNNER_TEMP/plugins.txt"
+          grep -q "enabled" "$RUNNER_TEMP/plugins.txt"
+
+  tests:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test test/
