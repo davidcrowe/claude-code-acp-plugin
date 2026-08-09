@@ -46,4 +46,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node --test test/
+      # Bare `node --test` auto-discovers ./test — `node --test test/` breaks
+      # on Linux node 22 (the trailing-slash arg is resolved as a module).
+      - run: node --test
