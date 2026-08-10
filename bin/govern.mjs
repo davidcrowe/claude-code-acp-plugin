@@ -62,13 +62,18 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.6.6";
+const PLUGIN_VERSION = "0.6.7";
 
 // Identifies the calling client to the server (per-client policy routing).
 // Each client's hooks.json sets this env var at invocation time:
 // "claude-code-plugin", "cursor", "codex", etc. Falls back to
 // claude-code-plugin for backward compat.
 const ACP_CLIENT = process.env.ACP_CLIENT || "claude-code-plugin";
+
+// Client-side disable for shadow-mode counterfactual notices
+// (gatewaystack-connect#607). The server also honors a tenant-level
+// shadowNotices:false; this env var is the local one-sentence off switch.
+const SHADOW_OFF = /^(off|0|false)$/i.test(process.env.ACP_SHADOW ?? "");
 
 // Harness quirk switch. Codex adopted Claude Code's hook wire format but
 // its parser only ACTS on permissionDecision "deny" — "ask" and
@@ -570,6 +575,14 @@ async function handlePostToolUse() {
       process.stdout.write(JSON.stringify({
         systemMessage: `[ACP] ${data.action === "block" ? "Blocked" : "Flagged"}: ${data.reason || "governance policy"}`,
       }));
+    } else if (!SHADOW_OFF && typeof data.notice === "string" && data.notice.trim()) {
+      // Shadow-mode counterfactual (gatewaystack-connect#607): the server
+      // sends a fully-formed "[ACP shadow] …" line for audit-mode tenants —
+      // what enforcement WOULD have done to the call that just ran. It is
+      // advisory only and arrives with action "pass"; frequency caps are
+      // server-side. ACP_SHADOW=off is the client-side belt to the server's
+      // suspenders (the tenant-level shadowNotices:false disable).
+      process.stdout.write(JSON.stringify({ systemMessage: data.notice }));
     }
   } catch {
     // silent pass-through
