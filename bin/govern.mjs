@@ -63,7 +63,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.10.0";
+const PLUGIN_VERSION = "0.10.1";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -367,6 +367,7 @@ async function handlePreToolUse() {
     tool_name: input.tool_name,
     tool_input: input.tool_input,
     session_id: input.session_id,
+    call_id: input.tool_use_id,
     cwd: input.cwd,
     hook_event_name: "PreToolUse",
     agent_tier: resolveAgentTier(),
@@ -569,6 +570,7 @@ async function handlePostToolUse() {
     tool_input: input.tool_input,
     tool_output: outputStr,
     session_id: input.session_id,
+    call_id: input.tool_use_id,
     cwd: input.cwd,
     hook_event_name: "PostToolUse",
     agent_tier: resolveAgentTier(),
