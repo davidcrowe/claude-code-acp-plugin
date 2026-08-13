@@ -40,7 +40,7 @@
 // always fails open on token-request errors and surfaces a stderr warning;
 // future versions will respect the server's `scopedTokensFailMode` policy.
 
-import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
+import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, readdirSync, statSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { createHash } from "crypto";
@@ -63,7 +63,15 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.9.0";
+const PLUGIN_VERSION = "0.10.0";
+
+// Console base for user-facing deep links (session receipt, #606).
+const ACP_CONSOLE =
+  process.env.ACP_CONSOLE_BASE || "https://cloud.agenticcontrolplane.com";
+
+// Per-session receipt counters (Stop hook). Written best-effort on
+// PostToolUse, read + cleared by handleStop.
+const SESSION_STATS_DIR = join(homedir(), ".acp", "session-stats");
 
 // Identifies the calling client to the server (per-client policy routing).
 // Each client's hooks.json sets this env var at invocation time:
@@ -572,6 +580,15 @@ async function handlePostToolUse() {
     clearTimeout(timeout);
     if (!res.ok) { process.exit(0); }
     const data = await res.json();
+    // Receipt bookkeeping (#606): one governed call, plus what ACP said
+    // about it. Counted only on a real server verdict — a call the
+    // gateway never saw is not claimed as governed.
+    const noticed = !SHADOW_OFF && typeof data.notice === "string" && data.notice.trim() !== "";
+    bumpReceiptStats(input.session_id, {
+      calls: 1,
+      flagged: data.action === "redact" || data.action === "block" ? 1 : 0,
+      notices: noticed ? 1 : 0,
+    });
     if (data.action === "redact" || data.action === "block") {
       process.stdout.write(JSON.stringify({
         systemMessage: `[ACP] ${data.action === "block" ? "Blocked" : "Flagged"}: ${data.reason || "governance policy"}`,
@@ -640,7 +657,78 @@ async function handleSessionStart() {
   process.exit(0);
 }
 
+/* ------------------------------------------------------------------ */
+/* Stop — session receipt (gatewaystack-connect#606)                    */
+/* ------------------------------------------------------------------ */
+
+// Canonical copy of the receipt logic lives in lib/receipt.mjs so tests
+// can pin the contract; this file carries the same logic inline (it is
+// deliberately self-contained, like vendor-patterns and attestation).
+function receiptStatsPath(sessionId) {
+  const safe = String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
+  return join(SESSION_STATS_DIR, `${safe}.json`);
+}
+
+function readReceiptStats(sessionId) {
+  try {
+    const raw = JSON.parse(readFileSync(receiptStatsPath(sessionId), "utf8"));
+    return { calls: Number(raw.calls) || 0, flagged: Number(raw.flagged) || 0, notices: Number(raw.notices) || 0 };
+  } catch {
+    return { calls: 0, flagged: 0, notices: 0 };
+  }
+}
+
+function bumpReceiptStats(sessionId, delta) {
+  if (!sessionId || sessionId === "unknown") return;
+  try {
+    mkdirSync(SESSION_STATS_DIR, { recursive: true });
+    const cur = readReceiptStats(sessionId);
+    writeFileSync(receiptStatsPath(sessionId), JSON.stringify({
+      calls: cur.calls + (delta.calls ?? 0),
+      flagged: cur.flagged + (delta.flagged ?? 0),
+      notices: cur.notices + (delta.notices ?? 0),
+    }));
+  } catch { /* bookkeeping must never touch the call path */ }
+}
+
+function clearReceiptStats(sessionId) {
+  try { unlinkSync(receiptStatsPath(sessionId)); } catch { /* absent is fine */ }
+  try {
+    const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+    for (const f of readdirSync(SESSION_STATS_DIR)) {
+      const p = join(SESSION_STATS_DIR, f);
+      try { if (statSync(p).mtimeMs < cutoff) unlinkSync(p); } catch { /* skip */ }
+    }
+  } catch { /* prune is opportunistic */ }
+}
+
+function buildReceiptLine(stats, sessionId) {
+  if (!stats || stats.calls <= 0) return null;
+  const parts = [`${stats.calls} tool call${stats.calls === 1 ? "" : "s"} governed`];
+  if (stats.flagged > 0) parts.push(`${stats.flagged} flagged`);
+  if (stats.notices > 0) parts.push(`${stats.notices} shadow notice${stats.notices === 1 ? "" : "s"}`);
+  return `[ACP] Session receipt: ${parts.join(" · ")} — review this session: ${ACP_CONSOLE}/sessions/${encodeURIComponent(String(sessionId))}`;
+}
+
+// One line at session end: what ACP governed, anything it said, and a
+// deep link to THIS session's timeline. Purely local (reads the counters
+// PostToolUse kept) — no network, no latency, silent when the session
+// used no tools. The counters are cleared so a resumed session starts a
+// fresh receipt, and stale files from crashed sessions are pruned.
+function handleStop() {
+  // stop_hook_active means WE are inside a stop-hook continuation —
+  // never loop or double-print the receipt.
+  if (input.stop_hook_active) process.exit(0);
+  try {
+    const msg = buildReceiptLine(readReceiptStats(input.session_id ?? "unknown"), input.session_id ?? "unknown");
+    if (msg) process.stdout.write(JSON.stringify({ systemMessage: msg }));
+  } catch { /* a receipt failure must never disturb session end */ }
+  clearReceiptStats(input.session_id ?? "unknown");
+  process.exit(0);
+}
+
 const hookEvent = typeof input.hook_event_name === "string" ? input.hook_event_name : "PreToolUse";
 if (hookEvent === "PostToolUse") handlePostToolUse();
 else if (hookEvent === "SessionStart") handleSessionStart();
+else if (hookEvent === "Stop") handleStop();
 else handlePreToolUse();
