@@ -28,19 +28,26 @@ function stubGateway(delays, payload = { decision: "allow" }) {
       resolve({ server, base: `http://127.0.0.1:${server.address().port}`, count: () => n })));
 }
 
-function runHook(base, { tier = "auto", budgets = {} } = {}) {
+function runHook(base, { tier = "unattended", budgets = {} } = {}) {
   return new Promise((resolve) => {
     const started = Date.now();
-    const child = spawn("node", [GOVERN], {
-      env: {
-        ...process.env,
-        ACP_GOVERN_BASE: base,
-        ACP_BEARER_TOKEN: "gsk_test_token",
-        ACP_CLIENT: "test",
-        ACP_FIRST_ATTEMPT_MS: String(budgets.first ?? 400),
-        ACP_RETRY_ATTEMPT_MS: String(budgets.retry ?? 400),
-      },
-    });
+    // Tier detection reads real signals (#692): CLAUDE_CODE_ENTRYPOINT and
+    // CI, not permission_mode "auto" (which is a human at the terminal and
+    // resolves interactive). Build the env explicitly — spreading
+    // process.env would leak the runner's own CI=true into the hook and
+    // flip every "interactive" case to background on GitHub Actions.
+    const env = {
+      HOME: process.env.HOME,
+      PATH: process.env.PATH,
+      ACP_GOVERN_BASE: base,
+      ACP_BEARER_TOKEN: "gsk_test_token",
+      ACP_CLIENT: "test",
+      ACP_FIRST_ATTEMPT_MS: String(budgets.first ?? 400),
+      ACP_RETRY_ATTEMPT_MS: String(budgets.retry ?? 400),
+    };
+    if (tier === "unattended") env.CLAUDE_CODE_ENTRYPOINT = "sdk-cli";
+    else env.CLAUDE_CODE_ENTRYPOINT = "cli";
+    const child = spawn("node", [GOVERN], { env });
     let out = "";
     child.stdout.on("data", (d) => { out += d; });
     child.on("close", () => {
@@ -59,7 +66,7 @@ function runHook(base, { tier = "auto", budgets = {} } = {}) {
       session_id: "t", cwd: "/tmp", hook_event_name: "PreToolUse",
       tool_name: "Bash", tool_use_id: "t1",
       tool_input: { command: "echo hi" },
-      permission_mode: tier === "auto" ? "auto" : "default",
+      permission_mode: "default",
     }));
   });
 }
@@ -67,7 +74,7 @@ function runHook(base, { tier = "auto", budgets = {} } = {}) {
 test("slow first answer, fast second: retried and ALLOWED (the #690 regression)", async () => {
   // First attempt overruns its budget; the retry lands on a warm instance.
   const { server, base, count } = await stubGateway([900, 10]);
-  const r = await runHook(base, { tier: "auto", budgets: { first: 400, retry: 600 } });
+  const r = await runHook(base, { tier: "unattended", budgets: { first: 400, retry: 600 } });
   assert.equal(r.decision, "allow", `expected allow, got ${r.decision}: ${r.message}`);
   assert.equal(count(), 2, "should have made exactly two attempts");
   server.close();
@@ -75,7 +82,7 @@ test("slow first answer, fast second: retried and ALLOWED (the #690 regression)"
 
 test("both attempts overrun at an unattended tier: still fails closed", async () => {
   const { server, base, count } = await stubGateway([900, 900]);
-  const r = await runHook(base, { tier: "auto", budgets: { first: 300, retry: 300 } });
+  const r = await runHook(base, { tier: "unattended", budgets: { first: 300, retry: 300 } });
   assert.equal(r.decision, "deny");
   assert.match(r.message, /stays blocked/);
   assert.equal(count(), 2);

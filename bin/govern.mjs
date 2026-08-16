@@ -63,7 +63,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.10.2";
+const PLUGIN_VERSION = "0.10.3";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -306,11 +306,92 @@ const headers = {
   "X-GS-Client": `${ACP_CLIENT}/${PLUGIN_VERSION}`,
 };
 
+/* ── Tier detection (gatewaystack-connect#692: truthful tier labels) ──
+ *
+ * The old permission_mode proxy was wrong in every case that matters:
+ * headless/cron `claude -p` runs reported "interactive" (the loosest tier
+ * for the most unattended shape), Task-spawned subagents inherit
+ * permission_mode and reported "interactive", and auto mode — a human at
+ * the terminal who chose it — reported "subagent".
+ *
+ * Real signals, most-restrictive-wins (an unattended session's subagent is
+ * still unattended):
+ *   1. bypassPermissions ................................. background
+ *   2. headless/programmatic entrypoint or CI env ........ background
+ *      (CLAUDE_CODE_ENTRYPOINT: "sdk-cli" is `claude -p`, "sdk-ts"/
+ *      "sdk-py" are SDK-driven, "mcp" is `claude mcp serve`,
+ *      "claude-code-github-action" is CI — nobody is watching any of
+ *      them; "cli", IDE and desktop entrypoints are attended.)
+ *   3. Task-spawned subagent (hook input carries agent_id) subagent
+ *   4. everything else — a human at a terminal/IDE, including
+ *      permission_mode "auto" ........................... interactive
+ *
+ * Detection failure NEVER bricks the call: fall back to "interactive"
+ * (the fail-open tier) LOUDLY — lapse.log line + detectError signal in
+ * tier_signals so the server audits the fallback.
+ */
+const HEADLESS_ENTRYPOINTS = ["sdk-cli", "sdk-ts", "sdk-py", "mcp", "claude-code-github-action"];
+
+let _tierDetection = null;
+function detectAgentTier() {
+  const signals = {};
+  try {
+    if (input.permission_mode === "bypassPermissions") {
+      signals.permissionMode = "bypassPermissions";
+      return { tier: "background", signals };
+    }
+    const entry = process.env.CLAUDE_CODE_ENTRYPOINT || "";
+    if (entry) signals.entrypoint = entry.slice(0, 32);
+    const ci = /^(1|true|yes)$/i.test(process.env.CI ?? "");
+    if (ci) signals.ci = true;
+    if (HEADLESS_ENTRYPOINTS.includes(entry) || ci) {
+      return { tier: "background", signals };
+    }
+    if (typeof input.agent_id === "string" && input.agent_id) {
+      signals.agentId = true;
+      return { tier: "subagent", signals };
+    }
+    return { tier: "interactive", signals };
+  } catch (err) {
+    // Fail open and LOUD — never brick a client on tier detection.
+    signals.detectError = true;
+    try {
+      appendFileSync(join(homedir(), ".acp", "lapse.log"),
+        JSON.stringify({ at: new Date().toISOString(), event: "tier-detect-error", tool: input.tool_name, detail: err?.message ?? "unknown" }) + "\n");
+    } catch { /* best-effort */ }
+    try {
+      process.stderr.write(`[ACP] tier detection failed (${err?.message ?? "unknown"}) — reporting "interactive" for this call; the fallback is flagged to the server via tier_signals.\n`);
+    } catch { /* best-effort */ }
+    return { tier: "interactive", signals };
+  }
+}
+
 function resolveAgentTier() {
-  const mode = input.permission_mode;
-  if (mode === "auto") return "subagent";
-  if (mode === "bypassPermissions") return "background";
-  return "interactive";
+  if (!_tierDetection) _tierDetection = detectAgentTier();
+  return _tierDetection.tier;
+}
+
+function tierSignals() {
+  if (!_tierDetection) _tierDetection = detectAgentTier();
+  return _tierDetection.signals;
+}
+
+// Tier-divergence notices (server flags client-reported ≠ enforced tier —
+// e.g. an attended session on a scoped API key) arrive on EVERY call for
+// the whole session; relay the first, dedupe the rest, same pattern as the
+// uncredentialed-session banner. The server's audit row is the durable
+// record — this marker only bounds terminal noise.
+function firstTierNoticeThisSession() {
+  const sessionId = String(input?.session_id ?? "unknown");
+  const marker = join(homedir(), ".acp", "tier-notice-session");
+  try {
+    if (readFileSync(marker, "utf8").trim() === sessionId) return false;
+  } catch { /* no marker yet */ }
+  try {
+    mkdirSync(join(homedir(), ".acp"), { recursive: true });
+    writeFileSync(marker, sessionId);
+  } catch { /* best-effort — at worst the notice repeats */ }
+  return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -372,6 +453,7 @@ async function handlePreToolUse() {
     hook_event_name: "PreToolUse",
     agent_tier: resolveAgentTier(),
     permission_mode: input.permission_mode,
+    tier_signals: tierSignals(),
   });
 
   // Three distinct deny categories — distinguishable at-a-glance.
@@ -460,6 +542,7 @@ async function handlePreToolUse() {
   }
 
   let policyAllowed = true;
+  let tierNotice = null;
   let res;
   try {
     try {
@@ -486,6 +569,13 @@ async function handlePreToolUse() {
     }
     // decision is allow (or unspecified) — continue to step 2.
     policyAllowed = true;
+    // Tier-divergence flag (#692): the server enforced a different tier
+    // than this client reported (never a deny by itself — the note rides
+    // on whatever the policy decided). Relay it once per session so the
+    // human learns the session's real tier without per-call spam.
+    if (typeof data.notice === "string" && data.notice.trim() && firstTierNoticeThisSession()) {
+      tierNotice = data.notice;
+    }
   } catch (err) {
     const reason = err && err.name === "AbortError"
       ? "request timed out twice"
@@ -494,19 +584,29 @@ async function handlePreToolUse() {
     return;
   }
 
+  // A hook run may write exactly ONE stdout JSON object — every allow-path
+  // exit funnels through here so the tier-divergence notice never produces
+  // a second one.
+  function exitAllow() {
+    if (tierNotice) {
+      process.stdout.write(JSON.stringify({ systemMessage: tierNotice }));
+    }
+    process.exit(0);
+  }
+
   // Step 2 (Phase 1): if the tool matches a vendor pattern, request a
   // scoped token and inject it via updatedInput.command. The agent's
   // local PAT is never read; ACP brokers the credential.
   const vendor = detectVendor(input.tool_name, input.tool_input);
   if (!vendor || !policyAllowed) {
-    process.exit(0);
+    exitAllow();
   }
 
   // Codex rejects updatedInput (see HARNESS note) — attempting injection
   // would mark the hook failed and run the tool anyway, minus the token.
   // Skip cleanly; the local-credential workflow continues unchanged.
   if (HARNESS === "codex") {
-    process.exit(0);
+    exitAllow();
   }
 
   const tokenResult = await requestScopedToken(vendor.provider);
@@ -515,7 +615,7 @@ async function handlePreToolUse() {
   // workflow continues unchanged. This is the non-breaking opt-in path
   // for tenants that haven't enabled scopedTokensEnabled.
   if (tokenResult.passThrough) {
-    process.exit(0);
+    exitAllow();
   }
 
   // User hasn't connected the provider via OAuth yet. Emit a deny with
@@ -545,7 +645,7 @@ async function handlePreToolUse() {
     process.stderr.write(
       `[ACP] Scoped-token request failed (${tokenResult.reason ?? `HTTP ${tokenResult.status}`}); falling back to local credentials for this call.\n`
     );
-    process.exit(0);
+    exitAllow();
   }
 
   // Success — inject the ACP-issued token via updatedInput.command.
@@ -569,12 +669,13 @@ async function handlePreToolUse() {
         permissionDecision: "allow",
         updatedInput: { ...input.tool_input, command: updated },
       },
+      ...(tierNotice ? { systemMessage: tierNotice } : {}),
     }));
     process.exit(0);
   }
 
   // No token + no failure case — should be unreachable, but exit safely.
-  process.exit(0);
+  exitAllow();
 }
 
 /* ------------------------------------------------------------------ */
@@ -602,6 +703,7 @@ async function handlePostToolUse() {
     cwd: input.cwd,
     hook_event_name: "PostToolUse",
     agent_tier: resolveAgentTier(),
+    tier_signals: tierSignals(),
   });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
