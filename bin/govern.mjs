@@ -555,6 +555,24 @@ async function handlePreToolUse() {
       res = await askPolicy(RETRY_ATTEMPT_MS);
     }
     if (!res.ok) {
+      // A 4xx carrying a decision body IS the verdict, not an outage: the
+      // gateway answers rate-limit denies (429) and invalid-tool denies
+      // (400) with {decision, reason}. Routing those through the outage
+      // posture made interactive sessions fail OPEN on a deliberate deny —
+      // rate limits were simply unenforced — while unattended tiers denied
+      // with a misleading "gateway unreachable" message. 5xx and bodyless
+      // 4xx (e.g. the auth guard's 401) keep the outage posture.
+      if (res.status >= 400 && res.status < 500) {
+        const verdict = await res.json().catch(() => null);
+        if (verdict && verdict.decision === "deny") {
+          denyByPolicy(verdict.reason || `denied (HTTP ${res.status})`);
+          return;
+        }
+        if (verdict && verdict.decision === "ask") {
+          ask(verdict.reason || "approval required");
+          return;
+        }
+      }
       denyGatewayError(res.status, res.statusText);
       return;
     }
