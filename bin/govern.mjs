@@ -63,7 +63,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.10.3";
+const PLUGIN_VERSION = "0.11.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -456,10 +456,37 @@ async function handlePreToolUse() {
     tier_signals: tierSignals(),
   });
 
-  // Three distinct deny categories — distinguishable at-a-glance.
+  // A deny is a control-flow event, not a full stop (gatewaystack-connect#692).
+  // Two things have to be true for an agent to route around one instead of
+  // abandoning the task:
+  //
+  //   1. The reason has to REACH THE MODEL. Claude Code reads
+  //      hookSpecificOutput.permissionDecisionReason (hooks.ts:598-610) into
+  //      blockingError, which is what the model sees; systemMessage goes to
+  //      the human. For most of this hook's life the cloud path set only
+  //      systemMessage, so every ACP deny arrived at the agent as the bare
+  //      fallback "Hook PreToolUse:<tool> denied this tool" — indistinguishable
+  //      from a harness bug, and impossible to re-plan on. That is the whole
+  //      of #690's "no reason" mystery, seen from the client end.
+  //   2. It has to say what to do NEXT. A denied call is one refused
+  //      operation, not a refused task: say so, and name the way to ask for
+  //      the capability rather than leaving the agent to guess or give up.
+  //
+  // Floors and governance-surface denies are the exception — they cannot be
+  // allowed by policy or approval in any direction, so pointing an agent at
+  // the proposal flow there would send it to file something no human can
+  // approve. Those get the honest "this one is not negotiable" steer instead.
+  const UNPROPOSABLE = /^\s*(hardline floor|governance surface)\s*:/i;
   function denyByPolicy(reason) {
+    const steer = UNPROPOSABLE.test(reason)
+      ? "This one cannot be allowed by policy or approval — do not retry it or look for another route to the same effect. Carry on with the rest of the task and tell the operator what you needed."
+      : "This refused ONE operation, not your task — continue with everything else. If you believe you should have this capability, call acp_propose_rule (tool, tier, rationale) to draft a rule for a human to approve; it is never applied by you.";
     process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" },
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: `[ACP] Denied by policy: ${reason}\n\n${steer}`,
+      },
       systemMessage: `[ACP] Denied by policy: ${reason}`,
     }));
     process.exit(0);
@@ -486,9 +513,17 @@ async function handlePreToolUse() {
       process.exit(0);
     }
     // Unattended tier: hold the line, say why honestly.
+    const outageMsg = `[ACP] Gateway unreachable (${detail}) — ${tier} tier stays blocked when policy can't be consulted (fail-closed for unattended agents; interactive sessions fail open).`;
     process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" },
-      systemMessage: `[ACP] Gateway unreachable (${detail}) — ${tier} tier stays blocked when policy can't be consulted (fail-closed for unattended agents; interactive sessions fail open).`,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        // An outage and a policy deny demand opposite responses: retry the
+        // first, never the second. Told apart only if the model is told
+        // which one this is — so name it, and say the call was never judged.
+        permissionDecisionReason: `${outageMsg}\n\nThis is an availability failure, NOT a policy judgment about this call — nothing decided that the operation was wrong. Do other work that doesn't need this tool, and retry later; if every route is blocked this way, stop and report the outage rather than working around it.`,
+      },
+      systemMessage: outageMsg,
     }));
     process.exit(0);
   }
@@ -504,8 +539,17 @@ async function handlePreToolUse() {
     // with the approval deep link so the human approves out-of-band and
     // the re-run passes under the grant.
     const decision = HARNESS === "codex" ? "deny" : "ask";
+    // Codex sees this as a hard deny, so it needs the out-of-band route
+    // spelled out; Claude Code renders a prompt and the human answers it.
+    const steer = decision === "deny"
+      ? "Codex cannot ask mid-run, so this arrives as a block. A human approves it on the dashboard and the re-run passes under the grant — continue with the rest of your task meanwhile."
+      : "A human is being asked now. This refused ONE operation, not your task.";
     process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: decision },
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: decision,
+        permissionDecisionReason: `[ACP] Approval required: ${reason}\n\n${steer}`,
+      },
       systemMessage: `[ACP] Approval required: ${reason}`,
     }));
     process.exit(0);
