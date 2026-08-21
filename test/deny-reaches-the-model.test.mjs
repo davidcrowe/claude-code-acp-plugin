@@ -136,6 +136,86 @@ test("an outage deny says it is availability, not a judgment about the call", as
   } finally { server.close(); }
 });
 
+// The server types every verdict by what the agent should DO (#692). The
+// hook must act on that field rather than on the prose, so reason wording
+// can change without silently changing the instruction the agent follows.
+test("kind:retry tells the agent to wait and retry, NOT to give up or reroute", async () => {
+  const { server, base } = await stubGateway(200, {
+    decision: "deny",
+    kind: "retry",
+    reason: "rate-limited: subagent (61/60 per minute)",
+  });
+  try {
+    const r = await runHook(base);
+    assert.equal(r.decision, "deny");
+    assert.match(r.toModel, /task is NOT over/i);
+    assert.match(r.toModel, /retry this exact call/i);
+    assert.match(r.toModel, /Do not rewrite it to dodge the limit/i);
+    // A throttle is not a capability question — proposing a rule is the
+    // wrong move and would put noise in front of a human.
+    assert.doesNotMatch(r.toModel, /acp_propose_rule/);
+  } finally { server.close(); }
+});
+
+test("kind:terminal overrides the proposable default even on unfamiliar wording", async () => {
+  const { server, base } = await stubGateway(200, {
+    decision: "deny",
+    kind: "terminal",
+    // Deliberately NOT the "hardline floor:" prefix the fallback regex knows.
+    reason: "immutable platform rule: credential exfiltration",
+  });
+  try {
+    const r = await runHook(base);
+    assert.doesNotMatch(r.toModel, /acp_propose_rule/,
+      "the typed kind must win over the prose fallback");
+    assert.match(r.toModel, /do not retry/i);
+  } finally { server.close(); }
+});
+
+test("kind:reformulate keeps the propose path", async () => {
+  const { server, base } = await stubGateway(200, {
+    decision: "deny",
+    kind: "reformulate",
+    reason: "denied by api tier policy for Bash.curl",
+  });
+  try {
+    const r = await runHook(base);
+    assert.match(r.toModel, /acp_propose_rule/);
+  } finally { server.close(); }
+});
+
+test("an older gateway with no kind still gets the right steer", async () => {
+  // Back-compat: the field is additive, so a gateway that predates it must
+  // behave exactly as before rather than falling into a default that
+  // invites an agent to propose its way around a floor.
+  const { server, base } = await stubGateway(200, {
+    decision: "deny",
+    reason: "hardline floor: fork bomb — blocked unconditionally",
+  });
+  try {
+    const r = await runHook(base);
+    assert.doesNotMatch(r.toModel, /acp_propose_rule/);
+    assert.match(r.toModel, /do not retry/i);
+  } finally { server.close(); }
+});
+
+test("segment evidence from the server reaches the model intact", async () => {
+  const { server, base } = await stubGateway(200, {
+    decision: "deny",
+    kind: "reformulate",
+    reason:
+      "denied by api tier policy for Bash.rm. This call had 3 operations and only operation 2 " +
+      "(`rm -rf /tmp/x` → Bash.rm) matched. Not matched: 1. `echo hi`, 3. `cat README`.",
+  });
+  try {
+    const r = await runHook(base);
+    // The blast radius is the part that lets an agent re-plan instead of
+    // treating the whole call as suspect.
+    assert.match(r.toModel, /operation 2/);
+    assert.match(r.toModel, /cat README/);
+  } finally { server.close(); }
+});
+
 test("an approval request explains the out-of-band route", async () => {
   const { server, base } = await stubGateway(200, {
     decision: "ask",

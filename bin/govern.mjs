@@ -476,11 +476,25 @@ async function handlePreToolUse() {
   // allowed by policy or approval in any direction, so pointing an agent at
   // the proposal flow there would send it to file something no human can
   // approve. Those get the honest "this one is not negotiable" steer instead.
+  // The server types every verdict by what the agent should DO about it
+  // (HookResponse.kind). Prefer that over reading the prose: the wording of
+  // a reason can change without anyone realizing it also changed the
+  // instruction the agent acts on. The regex is the fallback for a gateway
+  // older than the typed field.
   const UNPROPOSABLE = /^\s*(hardline floor|governance surface)\s*:/i;
-  function denyByPolicy(reason) {
-    const steer = UNPROPOSABLE.test(reason)
-      ? "This one cannot be allowed by policy or approval — do not retry it or look for another route to the same effect. Carry on with the rest of the task and tell the operator what you needed."
-      : "This refused ONE operation, not your task — continue with everything else. If you believe you should have this capability, call acp_propose_rule (tool, tier, rationale) to draft a rule for a human to approve; it is never applied by you.";
+  const STEER_BY_KIND = {
+    terminal:
+      "This one cannot be allowed by policy or approval — do not retry it or look for another route to the same effect. Carry on with the rest of the task and tell the operator what you needed.",
+    retry:
+      "Nothing is wrong with this call — there is just no capacity for it right now. Your task is NOT over: do other work, then retry this exact call shortly. Do not rewrite it to dodge the limit.",
+    delegate:
+      "This step is legitimate but only a human may perform it. Hand that one step over, and continue with everything else in your task.",
+    reformulate:
+      "This refused ONE operation, not your task — continue with everything else. If you believe you should have this capability, call acp_propose_rule (tool, tier, rationale) to draft a rule for a human to approve; it is never applied by you.",
+  };
+  function denyByPolicy(reason, kind) {
+    const steer = STEER_BY_KIND[kind]
+      || (UNPROPOSABLE.test(reason) ? STEER_BY_KIND.terminal : STEER_BY_KIND.reformulate);
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -609,7 +623,7 @@ async function handlePreToolUse() {
       if (res.status >= 400 && res.status < 500) {
         const verdict = await res.json().catch(() => null);
         if (verdict && verdict.decision === "deny") {
-          denyByPolicy(verdict.reason || `denied (HTTP ${res.status})`);
+          denyByPolicy(verdict.reason || `denied (HTTP ${res.status})`, verdict.kind);
           return;
         }
         if (verdict && verdict.decision === "ask") {
@@ -622,7 +636,7 @@ async function handlePreToolUse() {
     }
     const data = await res.json();
     if (data.decision === "deny") {
-      denyByPolicy(data.reason || "policy did not return a reason");
+      denyByPolicy(data.reason || "policy did not return a reason", data.kind);
       return;
     }
     if (data.decision === "ask") {
