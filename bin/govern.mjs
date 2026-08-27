@@ -63,7 +63,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.12.0";
+const PLUGIN_VERSION = "0.13.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -842,7 +842,7 @@ async function handleSessionStart() {
     const hookHash = sha256FileHex(fileURLToPath(import.meta.url));
     if (!hookHash) process.exit(0);
     const grantsHash = sha256FileHex(join(homedir(), ".acp", "harness-grants.json"));
-    await fetch(`${ACP_GOVERN}/govern/attest`, {
+    const res = await fetch(`${ACP_GOVERN}/govern/attest`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -857,6 +857,22 @@ async function handleSessionStart() {
       }),
       signal: controller.signal,
     });
+    // Upgrade notice (gatewaystack-connect#849): the attest response may
+    // carry a `notice` when this plugin version is behind the registry's
+    // latest — surfaced as SessionStart additionalContext so the MODEL
+    // sees it and can drive the upgrade (behind a human approval; the
+    // canonical installer is step_up-gated at the gateway). Once per
+    // session by construction: attest runs at SessionStart only.
+    // Canonical logic in lib/attestation.mjs (attestNoticeOutput).
+    const data = await res.json().catch(() => null);
+    if (data && typeof data.notice === "string" && data.notice.trim()) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "SessionStart",
+          additionalContext: data.notice.trim(),
+        },
+      }));
+    }
   } catch {
     // silent — absence of attestation is visible server-side by design
   } finally {
