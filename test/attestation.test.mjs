@@ -50,3 +50,20 @@ test("an attestation without a hook hash is no attestation at all", () => {
     null,
   );
 });
+
+import { attestNoticeOutput } from "../lib/attestation.mjs";
+
+test("upgrade notice from the attest response becomes SessionStart additionalContext", () => {
+  const out = attestNoticeOutput({ ok: true, verdict: "attested", notice: "  [ACP] v0.13.0 available  " });
+  assert.deepEqual(out, {
+    hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: "[ACP] v0.13.0 available" },
+  });
+});
+
+test("no notice, empty notice, or malformed response → no stdout object", () => {
+  assert.equal(attestNoticeOutput({ ok: true, verdict: "attested" }), null);
+  assert.equal(attestNoticeOutput({ notice: "   " }), null);
+  assert.equal(attestNoticeOutput({ notice: 42 }), null);
+  assert.equal(attestNoticeOutput(null), null);
+  assert.equal(attestNoticeOutput(undefined), null);
+});
