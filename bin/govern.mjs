@@ -33,7 +33,10 @@
 // with a loud UNGOVERNED warning + ~/.acp/lapse.log entry (never-brick:
 // an ACP outage must not freeze every governed session); subagent /
 // background tiers fail CLOSED (nobody is watching — the block IS the
-// safety net). Note: before v0.6.5 this comment claimed fail-open while
+// safety net). Since v0.14.0 (gatewaystack-connect#902) an interactive
+// lapse is also queued per session under ~/.acp/lapse-pending/ and carried
+// on the session's next PostToolUse as `pre_lapse`, so the gateway gets a
+// row for the call that ran ungoverned instead of only the local log. Note: before v0.6.5 this comment claimed fail-open while
 // the code failed closed — the posture is now real, decided, and tested.
 // Fails OPEN on /api/v1/scoped-tokens errors by default — server-side
 // per-tenant policy can flip this to fail-closed. The plugin currently
@@ -63,7 +66,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.13.0";
+const PLUGIN_VERSION = "0.14.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -72,6 +75,53 @@ const ACP_CONSOLE =
 // Per-session receipt counters (Stop hook). Written best-effort on
 // PostToolUse, read + cleared by handleStop.
 const SESSION_STATS_DIR = join(homedir(), ".acp", "session-stats");
+
+// Per-session pending lapse markers (gatewaystack-connect#902). Written on
+// an interactive fail-open at PreToolUse, carried on the next PostToolUse
+// as `pre_lapse`, and deleted once the gateway has acknowledged (2xx).
+// Bounded to LAPSE_PENDING_CAP entries per session — lapse.log keeps the
+// unbounded record. Every operation is best-effort: a marker failure must
+// never touch the call path in either direction.
+const LAPSE_PENDING_DIR = join(homedir(), ".acp", "lapse-pending");
+const LAPSE_PENDING_CAP = 20;
+
+function safeSessionFile(sessionId) {
+  return String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
+}
+
+function lapsePendingPath(sessionId) {
+  return join(LAPSE_PENDING_DIR, `${safeSessionFile(sessionId)}.json`);
+}
+
+function readPendingLapse(sessionId) {
+  if (!sessionId || sessionId === "unknown") return null;
+  try {
+    const raw = JSON.parse(readFileSync(lapsePendingPath(sessionId), "utf8"));
+    if (!Array.isArray(raw) || raw.length === 0) return null;
+    return raw.slice(-LAPSE_PENDING_CAP);
+  } catch {
+    return null;
+  }
+}
+
+function recordPendingLapse(sessionId, toolName, detail) {
+  if (!sessionId || sessionId === "unknown") return;
+  try {
+    mkdirSync(LAPSE_PENDING_DIR, { recursive: true });
+    const list = readPendingLapse(sessionId) ?? [];
+    list.push({
+      at: new Date().toISOString(),
+      tool: String(toolName ?? "unknown").slice(0, 120),
+      detail: String(detail ?? "unknown").slice(0, 200),
+    });
+    writeFileSync(lapsePendingPath(sessionId), JSON.stringify(list.slice(-LAPSE_PENDING_CAP)));
+  } catch { /* best-effort — lapse.log is the durable record */ }
+}
+
+function clearPendingLapse(sessionId) {
+  if (!sessionId || sessionId === "unknown") return;
+  try { unlinkSync(lapsePendingPath(sessionId)); } catch { /* absent is fine */ }
+}
 
 // Identifies the calling client to the server (per-client policy routing).
 // Each client's hooks.json sets this env var at invocation time:
@@ -520,9 +570,12 @@ async function handlePreToolUse() {
         appendFileSync(join(homedir(), ".acp", "lapse.log"),
           JSON.stringify({ at: new Date().toISOString(), tool: input.tool_name, tier, detail }) + "\n");
       } catch { /* the lapse log is best-effort — never block on it */ }
+      // Queue the lapse for the session's next PostToolUse (#902) so the
+      // gateway gets a row for the call it never saw.
+      recordPendingLapse(input.session_id, input.tool_name, detail);
       process.stdout.write(JSON.stringify({
         hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
-        systemMessage: `[ACP] ⚠ UNGOVERNED: gateway unreachable (${detail}) — call proceeded WITHOUT policy check. Lapse logged to ~/.acp/lapse.log; ACP has no record of this action.`,
+        systemMessage: `[ACP] ⚠ UNGOVERNED: gateway unreachable (${detail}) — call proceeded WITHOUT policy check. Lapse logged to ~/.acp/lapse.log and queued for this session's next governed call.`,
       }));
       process.exit(0);
     }
@@ -770,6 +823,9 @@ async function handlePostToolUse() {
   if (Buffer.byteLength(outputStr, "utf8") > POST_HOOK_PAYLOAD_CEILING) {
     outputStr = outputStr.slice(0, POST_HOOK_PAYLOAD_CEILING);
   }
+  // Lapses queued by a fail-open PreToolUse in this session (#902) ride
+  // along; the marker is cleared only after the gateway acknowledged.
+  const preLapse = readPendingLapse(input.session_id);
   const body = JSON.stringify({
     tool_name: input.tool_name,
     tool_input: input.tool_input,
@@ -780,6 +836,7 @@ async function handlePostToolUse() {
     hook_event_name: "PostToolUse",
     agent_tier: resolveAgentTier(),
     tier_signals: tierSignals(),
+    ...(preLapse ? { pre_lapse: preLapse } : {}),
   });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
@@ -787,6 +844,7 @@ async function handlePostToolUse() {
     const res = await fetch(`${ACP_GOVERN}/govern/tool-output`, { method: "POST", headers, body, signal: controller.signal });
     clearTimeout(timeout);
     if (!res.ok) { process.exit(0); }
+    if (preLapse) clearPendingLapse(input.session_id);
     const data = await res.json();
     // Receipt bookkeeping (#606): one governed call, plus what ACP said
     // about it. Counted only on a real server verdict — a call the
