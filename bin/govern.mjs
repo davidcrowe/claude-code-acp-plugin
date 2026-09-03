@@ -246,6 +246,34 @@ function warnUncredentialed(input) {
   }));
 }
 
+// Managed rollout, machine not enrolled: block the call and say how to enroll.
+// The lapse line is still written (BLOCKED, not UNGOVERNED) so the gap stays
+// auditable on the machine; the workspace can't see it yet because there is
+// no credential to report under. PreToolUse gets a deny the harness acts on
+// (Claude Code, Codex, Cursor all honor permissionDecision: "deny"); other
+// events carry the message only, since there is nothing to block.
+function blockUnenrolled(input) {
+  const sessionId = String(input?.session_id ?? "unknown");
+  try {
+    appendFileSync(
+      join(homedir(), ".acp", "lapse.log"),
+      `${new Date().toISOString()}\tBLOCKED\tno-credentials\tclient=${ACP_CLIENT}\tsession=${sessionId}\ttool=${input?.tool_name ?? "?"}\n`
+    );
+  } catch { /* best-effort — the deny below is the enforcement, not the log */ }
+  const reason =
+    "[ACP] Not enrolled: this machine runs your organization's ACP policy, but no workspace credential is present at ~/.acp/credentials. " +
+    `Enroll once: open ${ACP_CONSOLE}/plugin/authorize, then run: echo 'YOUR_API_KEY' > ~/.acp/credentials — and restart this session.`;
+  const ev = typeof input?.hook_event_name === "string" ? input.hook_event_name : "PreToolUse";
+  if (ev === "PreToolUse") {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
+      systemMessage: reason,
+    }));
+  } else {
+    process.stdout.write(JSON.stringify({ systemMessage: reason }));
+  }
+}
+
 const token = readToken();
 
 // LOCAL mode — the no-login, on-device runtime (`install.sh --local`).
@@ -254,8 +282,20 @@ const token = readToken();
 // ~/.acp/policy.json; every call is logged to ~/.acp/audit.jsonl. None of
 // the fetch() paths below are reachable — nothing leaves the machine.
 const ACP_DIR = join(homedir(), ".acp");
+
+// Managed rollouts. An admin who pushes this hook fleet-wide (Codex
+// requirements.toml, Claude Code managed settings, Cursor enterprise hooks)
+// sets ACP_REQUIRE_ENROLLMENT=1 in the managed hook command or managed env.
+// It changes exactly one thing: a machine with no workspace credential BLOCKS
+// each call with the enrollment step, instead of running it ungoverned with
+// a warning. Nothing else moves — gateway-unreachable posture stays as it is
+// (#385), and LOCAL mode is not a substitute, because managed means the
+// workspace policy, not a per-laptop one.
+const REQUIRE_ENROLLMENT = /^(1|true|required)$/i.test(process.env.ACP_REQUIRE_ENROLLMENT ?? "");
+
 const LOCAL =
   !token &&
+  !REQUIRE_ENROLLMENT &&
   (process.env.ACP_LOCAL === "1" || existsSync(join(ACP_DIR, "policy.json")));
 
 // Read stdin via async iteration, not readFileSync("/dev/stdin"): on Linux a
@@ -280,6 +320,10 @@ try {
 // what let installs sit ungoverned for weeks while the installer reported
 // success and the server saw a workspace indistinguishable from unused.
 if (!token && !LOCAL) {
+  if (REQUIRE_ENROLLMENT) {
+    blockUnenrolled(input);
+    process.exit(0);
+  }
   warnUncredentialed(input);
   process.exit(0);
 }
