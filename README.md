@@ -74,6 +74,16 @@ After setup, your dashboard is at:
 - **Policies**: `https://cloud.agenticcontrolplane.com/policies`
 - **Limits**: `https://cloud.agenticcontrolplane.com/limits`
 
+## Managed rollouts (enterprise)
+
+Pushing this hook to every seat from an admin console or MDM? The hook config
+carries no secret: each person enrolls once (their own key lands in
+`~/.acp/credentials`), so every call is attributed to a person. Set
+`ACP_REQUIRE_ENROLLMENT=1` in the managed hook command or managed `env` and an
+unenrolled machine **blocks** each call with the enrollment step instead of
+running it ungoverned with a warning. That is the only thing the flag changes.
+Per-harness recipes: https://agenticcontrolplane.com/docs/enterprise
+
 ## Pause / disable
 
 ```bash
